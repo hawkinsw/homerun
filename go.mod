@@ -2,7 +2,7 @@ module github.com/hawkinsw/homerun/v2
 
 go 1.18
 
-replace golang.org/x/net => /home/hawkinsw/code/gosrc/net
+//replace golang.org/x/net => /home/hawkinsw/code/gosrc/net
 
 require (
 	golang.org/x/net v0.0.0-20220812174116-3211cb980234

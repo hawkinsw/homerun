@@ -127,7 +127,9 @@ func (pd *PacerDownload) Start(
 	pd.downloaded = 0
 	pd.clientId = utilities.GenerateUniqueId()
 	transport := http2.Transport{}
-	transport.AdvertisedStreamWindowSize = 4 << 16
+	// This configuration option is only available with the patched version of the http2 library.
+	// 4 << 20 is the default.
+	//transport.AdvertisedStreamWindowSize = 4 << 20
 	transport.TLSClientConfig = &tls.Config{}
 	pd.tracer = trace.GenerateHttpTimingTracer(pd, pd.debug)
 

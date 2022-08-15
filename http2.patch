@@ -1,0 +1,344 @@
+diff --git a/http2/http2.go b/http2/http2.go
+index 6f2df28..b1ab984 100644
+--- a/http2/http2.go
++++ b/http2/http2.go
+@@ -56,7 +56,7 @@ const (
+ 
+ 	// SETTINGS_MAX_FRAME_SIZE default
+ 	// https://httpwg.org/specs/rfc7540.html#rfc.section.6.5.2
+-	initialMaxFrameSize = 16384
++	specInitialMaxFrameSize = 16384
+ 
+ 	// NextProtoTLS is the NPN/ALPN protocol negotiated during
+ 	// HTTP/2's TLS setup.
+@@ -65,7 +65,7 @@ const (
+ 	// https://httpwg.org/specs/rfc7540.html#SettingValues
+ 	initialHeaderTableSize = 4096
+ 
+-	initialWindowSize = 65535 // 6.9.2 Initial Flow Control Window Size
++	specInitialWindowSize = 65535 // 6.9.2 Initial Flow Control Window Size
+ 
+ 	defaultMaxReadFrameSize = 1 << 20
+ )
+diff --git a/http2/server.go b/http2/server.go
+index aa3b086..bf9143c 100644
+--- a/http2/server.go
++++ b/http2/server.go
+@@ -143,7 +143,7 @@ type Server struct {
+ }
+ 
+ func (s *Server) initialConnRecvWindowSize() int32 {
+-	if s.MaxUploadBufferPerConnection > initialWindowSize {
++	if s.MaxUploadBufferPerConnection > specInitialWindowSize {
+ 		return s.MaxUploadBufferPerConnection
+ 	}
+ 	return 1 << 20
+@@ -392,8 +392,8 @@ func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
+ 		doneServing:                 make(chan struct{}),
+ 		clientMaxStreams:            math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
+ 		advMaxStreams:               s.maxConcurrentStreams(),
+-		initialStreamSendWindowSize: initialWindowSize,
+-		maxFrameSize:                initialMaxFrameSize,
++		initialStreamSendWindowSize: specInitialWindowSize,
++		maxFrameSize:                specInitialMaxFrameSize,
+ 		headerTableSize:             initialHeaderTableSize,
+ 		serveG:                      newGoroutineLock(),
+ 		pushEnabled:                 true,
+@@ -421,8 +421,8 @@ func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
+ 	// These start at the RFC-specified defaults. If there is a higher
+ 	// configured value for inflow, that will be updated when we send a
+ 	// WINDOW_UPDATE shortly after sending SETTINGS.
+-	sc.flow.add(initialWindowSize)
+-	sc.inflow.add(initialWindowSize)
++	sc.flow.add(specInitialWindowSize)
++	sc.inflow.add(specInitialWindowSize)
+ 	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
+ 
+ 	fr := NewFramer(sc.bw, c)
+@@ -869,7 +869,7 @@ func (sc *serverConn) serve() {
+ 
+ 	// Each connection starts with initialWindowSize inflow tokens.
+ 	// If a higher value is configured, we add more tokens.
+-	if diff := sc.srv.initialConnRecvWindowSize() - initialWindowSize; diff > 0 {
++	if diff := sc.srv.initialConnRecvWindowSize() - specInitialWindowSize; diff > 0 {
+ 		sc.sendWindowUpdate(nil, int(diff))
+ 	}
+ 
+diff --git a/http2/server_test.go b/http2/server_test.go
+index ddd3daf..be1f687 100644
+--- a/http2/server_test.go
++++ b/http2/server_test.go
+@@ -315,7 +315,7 @@ func (st *serverTester) greetAndCheckSettings(checkSetting func(s Setting) error
+ 			if f.FrameHeader.StreamID != 0 {
+ 				st.t.Fatalf("WindowUpdate StreamID = %d; want 0", f.FrameHeader.StreamID)
+ 			}
+-			incr := uint32((&Server{}).initialConnRecvWindowSize() - initialWindowSize)
++			incr := uint32((&Server{}).initialConnRecvWindowSize() - specInitialWindowSize)
+ 			if f.Increment != incr {
+ 				st.t.Fatalf("WindowUpdate increment = %d; want %d", f.Increment, incr)
+ 			}
+diff --git a/http2/transport.go b/http2/transport.go
+index 90fdc28..b0668cb 100644
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -41,10 +41,10 @@ const (
+ 	// tokens we give the server at start-up, past the default 64k.
+ 	transportDefaultConnFlow = 1 << 30
+ 
+-	// transportDefaultStreamFlow is how many stream-level flow
++	// transportDefaultAdvertisedStreamFlow is how many stream-level flow
+ 	// control tokens we announce to the peer, and how many bytes
+ 	// we buffer per stream.
+-	transportDefaultStreamFlow = 4 << 20
++	transportDefaultAdvertisedStreamFlow = int32(4 << 20)
+ 
+ 	// transportDefaultStreamMinRefresh is the minimum number of bytes we'll send
+ 	// a stream-level WINDOW_UPDATE for at a time.
+@@ -52,10 +52,10 @@ const (
+ 
+ 	defaultUserAgent = "Go-http-client/2.0"
+ 
+-	// initialMaxConcurrentStreams is a connections maxConcurrentStreams until
++	// specInitialMaxConcurrentStreams is a connections maxConcurrentStreams until
+ 	// it's received servers initial SETTINGS frame, which corresponds with the
+ 	// spec's minimum recommended value.
+-	initialMaxConcurrentStreams = 100
++	specInitialMaxConcurrentStreams = 100
+ 
+ 	// defaultMaxConcurrentStreams is a connections default maxConcurrentStreams
+ 	// if the server doesn't include one in its initial SETTINGS frame.
+@@ -151,6 +151,11 @@ type Transport struct {
+ 	// The errType consists of only ASCII word characters.
+ 	CountError func(errType string)
+ 
++	// AdvertisedStreamWindowSize, if non-zero, specifies the window size for HTTP/2
++	// streams over connections created by this transport.
++	// Defaults to 4 << 20
++	AdvertisedStreamWindowSize int32
++
+ 	// t1, if non-nil, is the standard library Transport using
+ 	// this transport. Its settings are used (but not its
+ 	// RoundTrip method, etc).
+@@ -273,8 +278,8 @@ type ClientConn struct {
+ 
+ 	mu              sync.Mutex // guards following
+ 	cond            *sync.Cond // hold mu; broadcast on flow/closed changes
+-	flow            flow       // our conn-level flow control quota (cs.flow is per stream)
+-	inflow          flow       // peer's conn-level flow control
++	flow            flow       // outgoing conn-level flow control quota (cs.flow is per stream)
++	inflow          flow       // incoming conn-level flow control quota (cs.inflow is per stream)
+ 	doNotReuse      bool       // whether conn is marked to not be reused for any future requests
+ 	closing         bool
+ 	closed          bool
+@@ -291,10 +296,10 @@ type ClientConn struct {
+ 	lastActive      time.Time
+ 	lastIdle        time.Time // time last idle
+ 	// Settings from peer: (also guarded by wmu)
+-	maxFrameSize          uint32
+-	maxConcurrentStreams  uint32
+-	peerMaxHeaderListSize uint64
+-	initialWindowSize     uint32
++	maxFrameSize              uint32
++	maxConcurrentStreams      uint32
++	peerMaxHeaderListSize     uint64
++	outgoingInitialWindowSize uint32
+ 
+ 	// reqHeaderMu is a 1-element semaphore channel controlling access to sending new requests.
+ 	// Write to reqHeaderMu to lock it, read from it to unlock.
+@@ -338,10 +343,11 @@ type clientStream struct {
+ 	respHeaderRecv chan struct{}  // closed when headers are received
+ 	res            *http.Response // set if respHeaderRecv is closed
+ 
+-	flow        flow  // guarded by cc.mu
+-	inflow      flow  // guarded by cc.mu
+-	bytesRemain int64 // -1 means unknown; owned by transportResponseBody.Read
+-	readErr     error // sticky read error; owned by transportResponseBody.Read
++	flow                 flow  // guarded by cc.mu
++	inflow               flow  // guarded by cc.mu
++	advertisedWindowSize int32 // advertised window size for this stream; read-only after stream creation.
++	bytesRemain          int64 // -1 means unknown; owned by transportResponseBody.Read
++	readErr              error // sticky read error; owned by transportResponseBody.Read
+ 
+ 	reqBody              io.ReadCloser
+ 	reqBodyContentLength int64 // -1 means unknown
+@@ -662,20 +668,21 @@ func (t *Transport) NewClientConn(c net.Conn) (*ClientConn, error) {
+ }
+ 
+ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, error) {
++
+ 	cc := &ClientConn{
+-		t:                     t,
+-		tconn:                 c,
+-		readerDone:            make(chan struct{}),
+-		nextStreamID:          1,
+-		maxFrameSize:          16 << 10,                    // spec default
+-		initialWindowSize:     65535,                       // spec default
+-		maxConcurrentStreams:  initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
+-		peerMaxHeaderListSize: 0xffffffffffffffff,          // "infinite", per spec. Use 2^64-1 instead.
+-		streams:               make(map[uint32]*clientStream),
+-		singleUse:             singleUse,
+-		wantSettingsAck:       true,
+-		pings:                 make(map[[8]byte]chan struct{}),
+-		reqHeaderMu:           make(chan struct{}, 1),
++		t:                         t,
++		tconn:                     c,
++		readerDone:                make(chan struct{}),
++		nextStreamID:              1,
++		maxFrameSize:              specInitialMaxFrameSize,         // spec default
++		outgoingInitialWindowSize: specInitialWindowSize,           // spec default
++		maxConcurrentStreams:      specInitialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
++		peerMaxHeaderListSize:     0xffffffffffffffff,              // "infinite", per spec. Use 2^64-1 instead.
++		streams:                   make(map[uint32]*clientStream),
++		singleUse:                 singleUse,
++		wantSettingsAck:           true,
++		pings:                     make(map[[8]byte]chan struct{}),
++		reqHeaderMu:               make(chan struct{}, 1),
+ 	}
+ 	if d := t.idleConnTimeout(); d != 0 {
+ 		cc.idleTimeout = d
+@@ -686,7 +693,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
+ 	}
+ 
+ 	cc.cond = sync.NewCond(&cc.mu)
+-	cc.flow.add(int32(initialWindowSize))
++	cc.flow.add(int32(cc.outgoingInitialWindowSize))
+ 
+ 	// TODO: adjust this writer size to account for frame size +
+ 	// MTU + crypto/tls record padding.
+@@ -716,9 +723,14 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
+ 		cc.tlsState = &state
+ 	}
+ 
++	advertisedWindowSize := t.AdvertisedStreamWindowSize
++	if advertisedWindowSize == 0 {
++		advertisedWindowSize = transportDefaultAdvertisedStreamFlow
++	}
++
+ 	initialSettings := []Setting{
+ 		{ID: SettingEnablePush, Val: 0},
+-		{ID: SettingInitialWindowSize, Val: transportDefaultStreamFlow},
++		{ID: SettingInitialWindowSize, Val: mustUint31(advertisedWindowSize)},
+ 	}
+ 	if max := t.maxHeaderListSize(); max != 0 {
+ 		initialSettings = append(initialSettings, Setting{ID: SettingMaxHeaderListSize, Val: max})
+@@ -727,7 +739,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
+ 	cc.bw.Write(clientPreface)
+ 	cc.fr.WriteSettings(initialSettings...)
+ 	cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
+-	cc.inflow.add(transportDefaultConnFlow + initialWindowSize)
++	cc.inflow.add(int32(transportDefaultConnFlow))
+ 	cc.bw.Flush()
+ 	if cc.werr != nil {
+ 		cc.Close()
+@@ -1130,12 +1142,17 @@ func (cc *ClientConn) decrStreamReservationsLocked() {
+ 
+ func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
+ 	ctx := req.Context()
++	advertisedStreamWindowSize := transportDefaultAdvertisedStreamFlow
++	if cc.t != nil && cc.t.AdvertisedStreamWindowSize > 0 {
++		advertisedStreamWindowSize = cc.t.AdvertisedStreamWindowSize
++	}
+ 	cs := &clientStream{
+ 		cc:                   cc,
+ 		ctx:                  ctx,
+ 		reqCancel:            req.Cancel,
+ 		isHead:               req.Method == "HEAD",
+ 		reqBody:              req.Body,
++		advertisedWindowSize: advertisedStreamWindowSize,
+ 		reqBodyContentLength: actualContentLength(req),
+ 		trace:                httptrace.ContextClientTrace(ctx),
+ 		peerClosed:           make(chan struct{}),
+@@ -1977,9 +1994,9 @@ type resAndError struct {
+ 
+ // requires cc.mu be held.
+ func (cc *ClientConn) addStreamLocked(cs *clientStream) {
+-	cs.flow.add(int32(cc.initialWindowSize))
++	cs.flow.add(int32(cc.outgoingInitialWindowSize))
+ 	cs.flow.setConnFlow(&cc.flow)
+-	cs.inflow.add(transportDefaultStreamFlow)
++	cs.inflow.add(cs.advertisedWindowSize)
+ 	cs.inflow.setConnFlow(&cc.inflow)
+ 	cs.ID = cc.nextStreamID
+ 	cc.nextStreamID += 2
+@@ -2448,9 +2465,9 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
+ 		// Consider any buffered body data (read from the conn but not
+ 		// consumed by the client) when computing flow control for this
+ 		// stream.
+-		v := int(cs.inflow.available()) + cs.bufPipe.Len()
+-		if v < transportDefaultStreamFlow-transportDefaultStreamMinRefresh {
+-			streamAdd = int32(transportDefaultStreamFlow - v)
++		v := cs.inflow.available() + int32(cs.bufPipe.Len())
++		if v < cs.advertisedWindowSize-transportDefaultStreamMinRefresh {
++			streamAdd = cs.advertisedWindowSize - v
+ 			cs.inflow.add(streamAdd)
+ 		}
+ 	}
+@@ -2732,13 +2749,13 @@ func (rl *clientConnReadLoop) processSettingsNoWrite(f *SettingsFrame) error {
+ 			// Adjust flow control of currently-open
+ 			// frames by the difference of the old initial
+ 			// window size and this one.
+-			delta := int32(s.Val) - int32(cc.initialWindowSize)
++			delta := int32(s.Val) - int32(cc.outgoingInitialWindowSize)
+ 			for _, cs := range cc.streams {
+ 				cs.flow.add(delta)
+ 			}
+ 			cc.cond.Broadcast()
+ 
+-			cc.initialWindowSize = s.Val
++			cc.outgoingInitialWindowSize = s.Val
+ 		default:
+ 			// TODO(bradfitz): handle more settings? SETTINGS_HEADER_TABLE_SIZE probably.
+ 			cc.vlogf("Unhandled Setting: %v", s)
+diff --git a/http2/transport_test.go b/http2/transport_test.go
+index bf6683b..5daf995 100644
+--- a/http2/transport_test.go
++++ b/http2/transport_test.go
+@@ -2786,7 +2786,7 @@ func TestTransportFlowControl(t *testing.T) {
+ 		}
+ 		read += int64(n)
+ 
+-		const max = transportDefaultStreamFlow
++		const max = int64(transportDefaultAdvertisedStreamFlow)
+ 		if w := atomic.LoadInt64(&wrote); -max > read-w || read-w > max {
+ 			t.Fatalf("Too much data inflight: server wrote %v bytes but client only received %v", w, read)
+ 		}
+@@ -3046,7 +3046,7 @@ func TestTransportAdjustsFlowControl(t *testing.T) {
+ 				// initial flow control window's worth
+ 				// of request body data, give it just
+ 				// enough flow control to finish.
+-				if gotBytes >= initialWindowSize/2 && !sentSettings {
++				if gotBytes >= specInitialWindowSize/2 && !sentSettings {
+ 					sentSettings = true
+ 
+ 					ct.fr.WriteSettings(Setting{ID: SettingInitialWindowSize, Val: bodySize})
+@@ -5667,17 +5667,17 @@ func TestClientConnReservations(t *testing.T) {
+ 	cc := &ClientConn{
+ 		reqHeaderMu:          make(chan struct{}, 1),
+ 		streams:              make(map[uint32]*clientStream),
+-		maxConcurrentStreams: initialMaxConcurrentStreams,
++		maxConcurrentStreams: specInitialMaxConcurrentStreams,
+ 		nextStreamID:         1,
+ 		t:                    &Transport{},
+ 	}
+ 	cc.cond = sync.NewCond(&cc.mu)
+ 	n := 0
+-	for n <= initialMaxConcurrentStreams && cc.ReserveNewRequest() {
++	for n <= specInitialMaxConcurrentStreams && cc.ReserveNewRequest() {
+ 		n++
+ 	}
+-	if n != initialMaxConcurrentStreams {
+-		t.Errorf("did %v reservations; want %v", n, initialMaxConcurrentStreams)
++	if n != specInitialMaxConcurrentStreams {
++		t.Errorf("did %v reservations; want %v", n, specInitialMaxConcurrentStreams)
+ 	}
+ 	if _, err := cc.RoundTrip(new(http.Request)); !errors.Is(err, errNilRequestURL) {
+ 		t.Fatalf("RoundTrip error = %v; want errNilRequestURL", err)
+@@ -5696,7 +5696,7 @@ func TestClientConnReservations(t *testing.T) {
+ 	}
+ 
+ 	n2 = 0
+-	for n2 <= initialMaxConcurrentStreams && cc.ReserveNewRequest() {
++	for n2 <= specInitialMaxConcurrentStreams && cc.ReserveNewRequest() {
+ 		n2++
+ 	}
+ 	if n2 != n {
